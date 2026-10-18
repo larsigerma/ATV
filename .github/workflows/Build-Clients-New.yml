@@ -1,0 +1,857 @@
+name: Build AShell Clients-New
+run-name: Build ${{ inputs.Platform }} / ${{ inputs.BuildMode || '常规编译' }} -New
+
+on:
+  workflow_dispatch:
+    inputs:
+      Platform:
+        description: 客户端平台
+        type: choice
+        options: [Both, Android, Windows]
+        default: Both
+        required: false
+      BuildMode:
+        description: 构建模式
+        type: choice
+        options: [常规编译, 原始编译]
+        default: 常规编译
+        required: false
+
+# Build/download only. No release, repository write, or production signing secrets.
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.75.0"
+  FLUTTER_VERSION: "3.24.5"
+  CARGO_NDK_VERSION: "3.1.2"
+  NDK_VERSION: "27.2.12479018"
+  ANDROID_API: "21"
+  ANDROID_BUILD_TOOLS: "34.0.0"
+  ANDROID_CMDLINE_TOOLS_VERSION: "12266719" # 16.0, compatible with JDK 17
+  VCPKG_COMMIT_ID: "6f29f12e82a8293156836ad81cc9bf5af41fe836"
+  LLVM_VERSION: "15.0.6"
+  BUILD_MODE: ${{ inputs.BuildMode || '常规编译' }}
+  PORTABLE_COMPRESSION_LEVEL: "6"
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  CARGO_INCREMENTAL: "0"
+  VCPKG_DISABLE_METRICS: "1"
+  FLUTTER_SUPPRESS_ANALYTICS: "true"
+  CI: "true"
+
+jobs:
+  android-native:
+    if: inputs.Platform == 'Android' || inputs.Platform == 'Both'
+    name: Android Native
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool libtool-bin m4 gettext \
+            pkg-config libssl-dev cmake ninja-build perl patch python3 jq \
+            clang libclang-dev llvm-dev nasm yasm curl zip unzip tar xz-utils \
+            libasound2-dev libpulse-dev libudev-dev libva-dev libdrm-dev \
+            libx11-dev libxext-dev libxfixes-dev libxrandr-dev
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+          pkg-config --modversion openssl
+
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+        with:
+          cmdline-tools-version: ${{ env.ANDROID_CMDLINE_TOOLS_VERSION }}
+          packages: platform-tools
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install Android NDK
+        run: |
+          command -v sdkmanager
+          sdkmanager --version
+          sdkmanager --sdk_root="$ANDROID_HOME" "ndk;$NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target aarch64-linux-android
+          rustup default "$RUST_VERSION"
+
+      - name: Cache cargo-ndk tool
+        id: cargo-ndk-cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: cargo-ndk-ubuntu22-x64-${{ env.RUST_VERSION }}-${{ env.CARGO_NDK_VERSION }}
+
+      - name: Install cargo-ndk on cache miss
+        if: steps.cargo-ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo install cargo-ndk --version "$CARGO_NDK_VERSION" --locked
+
+      - name: Configure vcpkg
+        run: |
+          test "$(jq -r '."vcpkg-configuration"."default-registry".baseline' vcpkg.json)" = "$VCPKG_COMMIT_ID"
+          git clone https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/ashell-vcpkg"
+          git -C "$RUNNER_TEMP/ashell-vcpkg" checkout --detach "$VCPKG_COMMIT_ID"
+          "$RUNNER_TEMP/ashell-vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          mkdir -p "$RUNNER_TEMP/vcpkg-cache" "$RUNNER_TEMP/vcpkg-downloads"
+          echo "VCPKG_ROOT=$RUNNER_TEMP/ashell-vcpkg" >> "$GITHUB_ENV"
+          echo "VCPKG_INSTALLED_ROOT=$RUNNER_TEMP/ashell-vcpkg/installed" >> "$GITHUB_ENV"
+          echo "VCPKG_DOWNLOADS=$RUNNER_TEMP/vcpkg-downloads" >> "$GITHUB_ENV"
+          access=readwrite
+          if [ "$BUILD_MODE" = '原始编译' ]; then access=write; fi
+          echo "VCPKG_BINARY_SOURCES=clear;files,$RUNNER_TEMP/vcpkg-cache,$access" >> "$GITHUB_ENV"
+
+      - name: Restore vcpkg source downloads
+        id: vcpkg-downloads
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/vcpkg-downloads
+          key: vcpkg-downloads-ubuntu22-${{ env.VCPKG_COMMIT_ID }}-${{ hashFiles('vcpkg.json', 'res/vcpkg/**') }}
+          restore-keys: vcpkg-downloads-ubuntu22-${{ env.VCPKG_COMMIT_ID }}-
+
+      - name: Restore compiled native dependencies
+        id: native-cache
+        if: inputs.BuildMode != '原始编译'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/vcpkg-cache
+          key: vcpkg-ubuntu22-arm64-android-${{ env.NDK_VERSION }}-${{ env.VCPKG_COMMIT_ID }}-${{ hashFiles('vcpkg.json', 'res/vcpkg/**') }}
+
+      - name: Build native dependencies
+        timeout-minutes: 60
+        run: |
+          "$VCPKG_ROOT/vcpkg" install --triplet arm64-android \
+            --x-install-root="$VCPKG_INSTALLED_ROOT"
+
+      - name: Save completed native dependencies
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/vcpkg-cache
+          key: vcpkg-ubuntu22-arm64-android-${{ env.NDK_VERSION }}-${{ env.VCPKG_COMMIT_ID }}-${{ hashFiles('vcpkg.json', 'res/vcpkg/**') }}
+
+      - name: Save vcpkg source downloads
+        if: steps.vcpkg-downloads.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/vcpkg-downloads
+          key: ${{ steps.vcpkg-downloads.outputs.cache-primary-key }}
+
+      - name: Restore Rust dependency build cache
+        id: rust-cache
+        if: inputs.BuildMode != '原始编译'
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          prefix-key: ashell-rust-v1
+          key: android-arm64-flutter-hwcodec-${{ hashFiles('vcpkg.json', 'res/vcpkg/**', '.github/workflows/Build-Clients-New.yml') }}
+          env-vars: NDK_VERSION ANDROID_API VCPKG_COMMIT_ID LIBCLANG_PATH ImageVersion
+          cache-bin: false
+          cache-workspace-crates: false
+          cache-on-failure: true
+
+      - name: Restore Cargo source downloads
+        id: cargo-downloads
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-downloads-linux-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: cargo-downloads-linux-${{ env.RUST_VERSION }}-
+
+      - name: Compile libashell.so and stage JNI libraries
+        timeout-minutes: 100
+        run: |
+          ndk_sysroot="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          rust_target=aarch64-linux-android
+          # Scope bindgen to the Android target; host build scripts keep host headers.
+          test -d "$ndk_sysroot/usr/include/$rust_target"
+          export "BINDGEN_EXTRA_CLANG_ARGS_${rust_target//-/_}=--sysroot=$ndk_sysroot -I$ndk_sysroot/usr/include/$rust_target -D__ANDROID_API__=$ANDROID_API"
+          cargo ndk --platform "$ANDROID_API" --target "$rust_target" \
+            build --release --lib --features flutter,hwcodec
+          destination=native/arm64-v8a
+          mkdir -p "$destination"
+          cp "target/$rust_target/release/libashell.so" "$destination/"
+          cp "$ndk_sysroot/usr/lib/$rust_target/libc++_shared.so" "$destination/"
+          cp Cargo.lock native/Cargo-arm64-v8a.lock
+          test -s "$destination/libashell.so"
+          test -s "$destination/libc++_shared.so"
+
+      - name: Save Cargo source downloads
+        if: steps.cargo-downloads.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cargo-downloads.outputs.cache-primary-key }}
+
+      - name: Transfer JNI libraries to the APK job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: android-native-arm64-v8a
+          path: native/
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  android:
+    if: inputs.Platform == 'Android' || inputs.Platform == 'Both'
+    name: Android APK
+    needs: android-native
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      ANDROID_ARCH: aarch64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+        with:
+          cmdline-tools-version: ${{ env.ANDROID_CMDLINE_TOOLS_VERSION }}
+          packages: platform-tools
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+
+      - uses: subosito/flutter-action@fd55f4c5af5b953cc57a2be44cb082c8f6635e8e # v2.21.0
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+          cache-key: flutter-sdk-v1-:os:-:channel:-:version:-:arch:-${{ hashFiles('.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff') }}
+
+      - name: Configure Flutter and Android SDK
+        run: |
+          flutter config --no-analytics
+          patch="$GITHUB_WORKSPACE/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+          if git -C "$FLUTTER_ROOT" apply --reverse --check "$patch"; then
+            echo 'Flutter patch already present in SDK cache'
+          else
+            git -C "$FLUTTER_ROOT" apply --check "$patch"
+            git -C "$FLUTTER_ROOT" apply "$patch"
+          fi
+          command -v sdkmanager
+          sdkmanager --version
+          sdkmanager --sdk_root="$ANDROID_HOME" "platforms;android-34" "build-tools;$ANDROID_BUILD_TOOLS" "ndk;$NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS" >> "$GITHUB_PATH"
+          for file in src/bridge_generated.rs src/bridge_generated.io.rs flutter/lib/generated_bridge.dart flutter/lib/generated_bridge.freezed.dart; do
+            test -s "$file"
+          done
+
+      - name: Configure Gradle memory
+        run: |
+          # User-home properties override the project's local 1 GiB heap setting.
+          gradle_home="$RUNNER_TEMP/ashell-gradle"
+          echo "GRADLE_USER_HOME=$gradle_home" >> "$GITHUB_ENV"
+          mkdir -p "$gradle_home"
+          # Never reuse machine-local state committed by an old local build.
+          rm -rf flutter/android/.gradle
+          cat > "$gradle_home/gradle.properties" <<'EOF'
+          org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8
+          org.gradle.workers.max=2
+          org.gradle.parallel=false
+          org.gradle.vfs.watch=false
+          kotlin.compiler.execution.strategy=in-process
+          org.gradle.configuration-cache=false
+          EOF
+          if [ "$BUILD_MODE" = '原始编译' ]; then
+            echo 'org.gradle.caching=false' >> "$gradle_home/gradle.properties"
+            (cd flutter && flutter clean)
+          else
+            echo 'org.gradle.caching=true' >> "$gradle_home/gradle.properties"
+          fi
+
+      - name: Cache Gradle dependency downloads
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ${{ env.GRADLE_USER_HOME }}/wrapper/dists
+            ${{ env.GRADLE_USER_HOME }}/caches/modules-2
+          key: gradle-downloads-v1-ubuntu22-jdk17-${{ hashFiles('flutter/android/**/*.gradle', 'flutter/android/gradle/wrapper/gradle-wrapper.properties', 'flutter/pubspec.lock') }}
+          restore-keys: gradle-downloads-v1-ubuntu22-jdk17-
+
+      - name: Cache Gradle task outputs
+        if: inputs.BuildMode != '原始编译'
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.GRADLE_USER_HOME }}/caches/build-cache-1
+          key: gradle-tasks-v1-ubuntu22-jdk17-${{ env.FLUTTER_VERSION }}-${{ hashFiles('flutter/android/**/*.gradle', 'flutter/android/gradle.properties', 'flutter/android/gradle/wrapper/gradle-wrapper.properties', 'flutter/pubspec.lock') }}-${{ github.sha }}
+          restore-keys: gradle-tasks-v1-ubuntu22-jdk17-${{ env.FLUTTER_VERSION }}-${{ hashFiles('flutter/android/**/*.gradle', 'flutter/android/gradle.properties', 'flutter/android/gradle/wrapper/gradle-wrapper.properties', 'flutter/pubspec.lock') }}-
+
+      - name: Download native libraries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: android-native-arm64-v8a
+          path: ${{ runner.temp }}/android-native
+
+      - name: Prepare JNI libraries and resolved Cargo lock
+        run: |
+          source="$RUNNER_TEMP/android-native"
+          destination=flutter/android/app/src/main/jniLibs/arm64-v8a
+          mkdir -p "$destination" artifacts/android
+          for library in libashell.so libc++_shared.so; do
+            test -s "$source/arm64-v8a/$library"
+            cp "$source/arm64-v8a/$library" "$destination/"
+          done
+          test -s "$source/Cargo-arm64-v8a.lock"
+          cp "$source/Cargo-arm64-v8a.lock" artifacts/android/
+
+      - name: Create an ephemeral test signing identity
+        run: |
+          # Public Android test-key conventions; this is not a production identity.
+          keytool -genkeypair -noprompt -keystore "$RUNNER_TEMP/ashell-test.jks" \
+            -storetype JKS -storepass android -keypass android -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 30 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          cat > flutter/android/key.properties <<EOF
+          storeFile=$RUNNER_TEMP/ashell-test.jks
+          storePassword=android
+          keyAlias=androiddebugkey
+          keyPassword=android
+          EOF
+
+      - name: Resolve Flutter dependencies and compile Release APK
+        run: |
+          cd flutter
+          flutter pub get
+          flutter build apk --release --no-pub --target-platform android-arm64 --split-per-abi
+          apk=build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          test -s "$apk"
+          mkdir -p ../artifacts/android
+          cp "$apk" "../artifacts/android/ashell-android-$ANDROID_ARCH.apk"
+
+      - name: Verify APK contents, signature and provenance
+        run: |
+          apk="artifacts/android/ashell-android-$ANDROID_ARCH.apk"
+          apksigner verify --verbose --print-certs "$apk" > artifacts/android/signature.txt
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, zipfile
+          root = pathlib.Path('.')
+          out = root / 'artifacts/android'
+          apk = next(out.glob('*.apk'))
+          expected = {'arm64-v8a'}
+          with zipfile.ZipFile(apk) as archive:
+              names = set(archive.namelist())
+          abis = {name.split('/')[1] for name in names if name.startswith('lib/') and name.endswith('.so')}
+          assert abis == expected, f'Unexpected APK ABIs: {abis}; expected {expected}'
+          for abi in expected:
+              for library in ('libashell.so', 'libc++_shared.so', 'libflutter.so', 'libapp.so'):
+                  assert f'lib/{abi}/{library}' in names, f'Missing {abi}/{library}'
+          assert not any(name.endswith('/libadb.so') for name in names), 'Retired libadb.so was packaged'
+          (out / 'apk-contents.txt').write_text('\n'.join(sorted(names)) + '\n', encoding='utf-8')
+          info = {key: os.environ[key] for key in ('GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'RUST_VERSION', 'FLUTTER_VERSION', 'NDK_VERSION', 'ANDROID_CMDLINE_TOOLS_VERSION', 'VCPKG_COMMIT_ID', 'ANDROID_ARCH', 'BUILD_MODE')}
+          info['signing'] = 'ephemeral Android test key; not for production'
+          info['lock_sha256'] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(out.glob('Cargo-*.lock'))}
+          info['lock_sha256']['pubspec.lock'] = hashlib.sha256(pathlib.Path('flutter/pubspec.lock').read_bytes()).hexdigest()
+          (out / 'build-info.json').write_text(json.dumps(info, indent=2) + '\n', encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(f'{hashlib.sha256(apk.read_bytes()).hexdigest()}  {apk.name}\n', encoding='utf-8')
+          (out / 'pubspec.lock').write_bytes(pathlib.Path('flutter/pubspec.lock').read_bytes())
+          PY
+          flutter --version > artifacts/android/flutter-version.txt
+          java -version 2> artifacts/android/java-version.txt
+
+      - name: Upload Android build information
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ashell-android-build-info-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            artifacts/android/
+            !artifacts/android/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload APK directly
+        id: upload-apk
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # Match the filename so overwrite also works when rerunning this job.
+          name: ashell-android-aarch64.apk
+          path: artifacts/android/ashell-android-aarch64.apk
+          archive: false
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Download summary
+        env:
+          APK_URL: ${{ steps.upload-apk.outputs.artifact-url }}
+        run: |
+          printf '### Android APK\n[下载 APK](%s)\n\n产物保留 14 天 校验与构建信息另存于 build-info 产物\n' "$APK_URL" >> "$GITHUB_STEP_SUMMARY"
+
+  windows:
+    if: inputs.Platform == 'Windows' || inputs.Platform == 'Both'
+    name: Windows EXE
+    runs-on: windows-2022
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11.9"
+
+      - name: Set up MSYS2 build tools
+        id: msys2
+        uses: msys2/setup-msys2@fb197b72ce45fb24f17bf3f807a388985654d1f2 # v2.29.0
+        with:
+          msystem: MSYS
+          path-type: minimal
+          update: true
+          install: >-
+            bash coreutils diffutils file findutils gawk grep gzip make patch
+            perl pkgconf sed tar unzip autoconf automake1.16 libtool
+            mingw-w64-x86_64-pkgconf
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - uses: KyleMayes/install-llvm-action@a7a1a882e2d06ebe05d5bb97c3e1f8c984ae96fc # v2.0.7
+        with:
+          version: ${{ env.LLVM_VERSION }}
+          directory: ${{ runner.temp }}/ashell-llvm
+          env: "false" # Keep MSVC as the C/C++ compiler; LLVM supplies libclang.
+
+      - uses: subosito/flutter-action@fd55f4c5af5b953cc57a2be44cb082c8f6635e8e # v2.21.0
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+          cache-key: flutter-sdk-v1-:os:-:channel:-:version:-:arch:-${{ hashFiles('.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff') }}
+
+      - name: Configure the Windows build environment
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install "${env:RUST_VERSION}-x86_64-pc-windows-msvc" --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Rust install failed' }
+          rustup default "${env:RUST_VERSION}-x86_64-pc-windows-msvc"
+          if ($LASTEXITCODE -ne 0) { throw 'Rust selection failed' }
+          python -m pip install brotli==1.1.0 cmake==3.28.3
+          if ($LASTEXITCODE -ne 0) { throw 'Python build tools install failed' }
+          "LIBCLANG_PATH=$env:RUNNER_TEMP/ashell-llvm/bin" >> $env:GITHUB_ENV
+          flutter config --no-analytics --enable-windows-desktop
+          if ($LASTEXITCODE -ne 0) { throw 'Flutter configuration failed' }
+          $patch = "$env:GITHUB_WORKSPACE/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+          git -C $env:FLUTTER_ROOT apply --reverse --check $patch
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host 'Flutter patch already present in SDK cache'
+          } else {
+            git -C $env:FLUTTER_ROOT apply --check $patch
+            if ($LASTEXITCODE -ne 0) { throw 'Flutter patch does not match cached SDK' }
+            git -C $env:FLUTTER_ROOT apply $patch
+            if ($LASTEXITCODE -ne 0) { throw 'Flutter patch failed' }
+          }
+          if ($env:BUILD_MODE -eq '原始编译') {
+            Push-Location flutter
+            try {
+              flutter clean
+              if ($LASTEXITCODE -ne 0) { throw 'Flutter clean failed' }
+            } finally { Pop-Location }
+          }
+          foreach ($file in @('src/bridge_generated.rs', 'src/bridge_generated.io.rs', 'flutter/lib/generated_bridge.dart', 'flutter/lib/generated_bridge.freezed.dart')) {
+            if (!(Test-Path -LiteralPath $file)) { throw "Missing tracked bridge: $file" }
+          }
+
+      - name: Configure vcpkg
+        id: vcpkg
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $manifest = Get-Content -Raw vcpkg.json | ConvertFrom-Json
+          if ($manifest.'vcpkg-configuration'.'default-registry'.baseline -ne $env:VCPKG_COMMIT_ID) { throw 'vcpkg baseline mismatch' }
+          $vcpkgPath = Join-Path $env:RUNNER_TEMP 'ashell-vcpkg'
+          git clone https://github.com/microsoft/vcpkg.git $vcpkgPath
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg clone failed' }
+          git -C $vcpkgPath checkout --detach $env:VCPKG_COMMIT_ID
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg checkout failed' }
+          & "$vcpkgPath/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+          # This pinned vcpkg downloads MSYS2 packages that upstream has removed.
+          # Use the complete pacman-managed tool environment for pkgconf/libvpx/ffmpeg.
+          # Keep the dependency baseline, ports and MSVC compiler unchanged.
+          $msysRoot = (Resolve-Path -LiteralPath $env:MSYS2_LOCATION).Path.Replace('\', '/')
+          foreach ($tool in @('usr/bin/bash.exe', 'usr/bin/make.exe', 'usr/bin/perl.exe', 'mingw64/bin/pkg-config.exe', 'usr/share/automake-1.16/compile')) {
+            if (!(Test-Path -LiteralPath "$msysRoot/$tool")) { throw "Missing MSYS2 tool: $tool" }
+          }
+          $msysPackages = Join-Path $env:RUNNER_TEMP 'ashell-msys2-packages.txt'
+          & "$msysRoot/usr/bin/pacman.exe" -Q | Set-Content -Encoding utf8 $msysPackages
+          if ($LASTEXITCODE -ne 0) { throw 'MSYS2 package inventory failed' }
+          "msys2-hash=$((Get-FileHash -LiteralPath $msysPackages -Algorithm SHA256).Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          $acquireMsys = Join-Path $vcpkgPath 'scripts/cmake/vcpkg_acquire_msys.cmake'
+          $source = [IO.File]::ReadAllText($acquireMsys)
+          $anchor = 'function(vcpkg_acquire_msys out_msys_root)'
+          if (($source.Split($anchor).Count - 1) -ne 1) { throw 'Unexpected vcpkg MSYS2 helper; review the integration' }
+          $replacement = @'
+          function(vcpkg_acquire_msys out_msys_root)
+              set("${out_msys_root}" "@ASHELL_MSYS_ROOT@" PARENT_SCOPE)
+              return()
+          '@
+          $replacement = $replacement.Replace('@ASHELL_MSYS_ROOT@', $msysRoot)
+          [IO.File]::WriteAllText($acquireMsys, $source.Replace($anchor, $replacement), [Text.UTF8Encoding]::new($false))
+          $cachePath = Join-Path $env:RUNNER_TEMP 'vcpkg-cache'
+          New-Item -ItemType Directory -Force $cachePath | Out-Null
+          $downloadsPath = Join-Path $env:RUNNER_TEMP 'vcpkg-downloads'
+          New-Item -ItemType Directory -Force $downloadsPath | Out-Null
+          "VCPKG_ROOT=$vcpkgPath" >> $env:GITHUB_ENV
+          "VCPKG_INSTALLED_ROOT=$vcpkgPath/installed" >> $env:GITHUB_ENV
+          "VCPKG_DOWNLOADS=$downloadsPath" >> $env:GITHUB_ENV
+          'VCPKG_DEFAULT_TRIPLET=x64-windows-static' >> $env:GITHUB_ENV
+          'VCPKG_DEFAULT_HOST_TRIPLET=x64-windows-static' >> $env:GITHUB_ENV
+          $access = if ($env:BUILD_MODE -eq '原始编译') { 'write' } else { 'readwrite' }
+          "VCPKG_BINARY_SOURCES=clear;files,$cachePath,$access" >> $env:GITHUB_ENV
+
+      - name: Restore vcpkg source downloads
+        id: vcpkg-downloads
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/vcpkg-downloads
+          key: vcpkg-downloads-windows2022-${{ env.VCPKG_COMMIT_ID }}-${{ hashFiles('vcpkg.json', 'res/vcpkg/**') }}
+          restore-keys: vcpkg-downloads-windows2022-${{ env.VCPKG_COMMIT_ID }}-
+
+      - name: Restore compiled native dependencies
+        id: native-cache
+        if: inputs.BuildMode != '原始编译'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/vcpkg-cache
+          key: vcpkg-windows2022-x64-static-msys2-${{ steps.vcpkg.outputs.msys2-hash }}-${{ env.VCToolsVersion }}-${{ env.VCPKG_COMMIT_ID }}-${{ hashFiles('vcpkg.json', 'res/vcpkg/**') }}
+
+      - name: Build native dependencies
+        timeout-minutes: 90
+        run: |
+          & "$env:VCPKG_ROOT/vcpkg.exe" install --triplet x64-windows-static "--x-install-root=$env:VCPKG_INSTALLED_ROOT"
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg install failed' }
+
+      - name: Save completed native dependencies
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/vcpkg-cache
+          key: vcpkg-windows2022-x64-static-msys2-${{ steps.vcpkg.outputs.msys2-hash }}-${{ env.VCToolsVersion }}-${{ env.VCPKG_COMMIT_ID }}-${{ hashFiles('vcpkg.json', 'res/vcpkg/**') }}
+
+      - name: Save vcpkg source downloads
+        if: steps.vcpkg-downloads.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/vcpkg-downloads
+          key: ${{ steps.vcpkg-downloads.outputs.cache-primary-key }}
+
+      - name: Restore Rust dependency build cache
+        id: rust-cache
+        if: inputs.BuildMode != '原始编译'
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          prefix-key: ashell-rust-v1
+          key: windows-x64-flutter-hwcodec-vram-${{ steps.vcpkg.outputs.msys2-hash }}-${{ hashFiles('vcpkg.json', 'res/vcpkg/**', '.github/workflows/Build-Clients-New.yml') }}
+          env-vars: VCPKG_COMMIT_ID LLVM_VERSION VCToolsVersion WindowsSDKVersion ImageVersion
+          cache-bin: false
+          cache-workspace-crates: false
+          cache-on-failure: true
+
+      - name: Restore Cargo source downloads
+        id: cargo-downloads
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-downloads-windows-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: cargo-downloads-windows-${{ env.RUST_VERSION }}-
+
+      - name: Resolve Flutter dependencies
+        timeout-minutes: 10
+        run: |
+          Push-Location flutter
+          try {
+            flutter pub get
+            if ($LASTEXITCODE -ne 0) { throw 'flutter pub get failed' }
+          } finally { Pop-Location }
+
+      - name: Compile Windows client
+        timeout-minutes: 120
+        run: |
+          python build.py --portable --hwcodec --flutter --vram --skip-portable-pack
+          if ($LASTEXITCODE -ne 0) { throw 'Windows client build failed' }
+
+      - name: Save Cargo source downloads
+        if: steps.cargo-downloads.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cargo-downloads.outputs.cache-primary-key }}
+
+      - name: Create an ephemeral test signing identity
+        id: signing-identity
+        shell: powershell
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if (!$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'Test signing requires the elevated GitHub-hosted Windows runner.'
+          }
+          Write-Host "[$(Get-Date -Format o)] Checking the compiled Release bundle"
+          $bundle = Join-Path $env:GITHUB_WORKSPACE 'flutter/build/windows/x64/runner/Release'
+          foreach ($file in @('ashell.exe', 'ashell.dll', 'flutter_windows.dll', 'dylib_virtual_display.dll', 'data/icudtl.dat', 'data/app.so')) {
+            $item = Get-Item -LiteralPath (Join-Path $bundle $file) -ErrorAction Stop
+            if ($item.Length -eq 0) { throw "Empty compiled file: $file" }
+          }
+          $output = Join-Path $env:GITHUB_WORKSPACE 'artifacts/windows'
+          New-Item -ItemType Directory -Force $output | Out-Null
+          # The private key stays in this disposable runner's certificate store.
+          # Only the public certificate and verification results enter artifacts.
+          $certParameters = @{
+            Type = 'CodeSigningCert'
+            Subject = 'CN=AShell Test Signing'
+            CertStoreLocation = 'Cert:\CurrentUser\My'
+            KeyAlgorithm = 'RSA'; KeyLength = 2048; HashAlgorithm = 'SHA256'
+            KeyExportPolicy = 'NonExportable'
+            NotAfter = (Get-Date).AddDays(30)
+          }
+          Write-Host "[$(Get-Date -Format o)] Creating the ephemeral test certificate"
+          $certificate = New-SelfSignedCertificate @certParameters
+          # Record the public thumbprint immediately, including for failure cleanup.
+          "thumbprint=$($certificate.Thumbprint)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "ASHELL_TEST_CERT_THUMBPRINT=$($certificate.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $publicCertificate = Join-Path $output 'ashell-test-signing.cer'
+          Export-Certificate -Cert $certificate -FilePath $publicCertificate -Type CERT | Out-Null
+          Write-Host "[$(Get-Date -Format o)] Trusting the test certificate on the disposable runner"
+          Import-Certificate -FilePath $publicCertificate -CertStoreLocation 'Cert:\LocalMachine\Root' -Confirm:$false | Out-Null
+          Write-Host "[$(Get-Date -Format o)] Test certificate imported"
+          @'
+          function Add-TestSignature([string]$Path, [string]$Label) {
+            $certificate = Get-Item -LiteralPath "Cert:\CurrentUser\My\$env:ASHELL_TEST_CERT_THUMBPRINT" -ErrorAction Stop
+            Write-Host "[$(Get-Date -Format o)] Signing $Label"
+            Set-AuthenticodeSignature -LiteralPath $Path -Certificate $certificate -HashAlgorithm SHA256 -IncludeChain Signer | Out-Null
+            Write-Host "[$(Get-Date -Format o)] Verifying $Label"
+            $signature = Get-AuthenticodeSignature -LiteralPath $Path
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) {
+              throw "Test signature verification failed for ${Label}: $($signature.Status) / $($signature.StatusMessage)"
+            }
+            $record = [ordered]@{
+              file = $Label; status = [string]$signature.Status
+              subject = $signature.SignerCertificate.Subject
+              thumbprint = $signature.SignerCertificate.Thumbprint
+              not_after_utc = $signature.SignerCertificate.NotAfter.ToUniversalTime().ToString('o')
+              sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+            $recordsPath = Join-Path $env:GITHUB_WORKSPACE 'artifacts/windows/signatures.json'
+            $records = @()
+            if (Test-Path -LiteralPath $recordsPath) {
+              foreach ($existing in (Get-Content -Raw -LiteralPath $recordsPath | ConvertFrom-Json)) {
+                $records += $existing
+              }
+            }
+            $records += $record
+            ConvertTo-Json -InputObject $records -Depth 4 | Set-Content -Encoding utf8 $recordsPath
+            Write-Host "[$(Get-Date -Format o)] Signature verified for $Label"
+          }
+          '@ | Set-Content -Encoding utf8 "$env:RUNNER_TEMP/ashell-sign.ps1"
+
+      - name: Test-sign and verify the Release bundle
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . "$env:RUNNER_TEMP/ashell-sign.ps1"
+          $bundle = Join-Path $env:GITHUB_WORKSPACE 'flutter/build/windows/x64/runner/Release'
+          foreach ($file in @('ashell.exe', 'ashell.dll', 'dylib_virtual_display.dll')) {
+            Add-TestSignature -Path (Join-Path $bundle $file) -Label "Release/$file"
+          }
+
+      - name: Package the signed Release ZIP
+        timeout-minutes: 15
+        run: |
+          $bundle = Join-Path $env:GITHUB_WORKSPACE 'flutter/build/windows/x64/runner/Release'
+          Compress-Archive -Path "$bundle/*" -DestinationPath 'artifacts/windows/ashell-windows-x64.zip'
+          $zip = Get-Item -LiteralPath 'artifacts/windows/ashell-windows-x64.zip' -ErrorAction Stop
+          if ($zip.Length -eq 0) { throw 'Empty Release ZIP' }
+          $archive = [IO.Compression.ZipFile]::OpenRead($zip.FullName)
+          try {
+            foreach ($file in @('ashell.exe', 'ashell.dll', 'flutter_windows.dll', 'dylib_virtual_display.dll', 'data/icudtl.dat', 'data/app.so')) {
+              $entry = $archive.GetEntry($file)
+              if ($null -eq $entry -or $entry.Length -eq 0) { throw "Missing or empty ZIP entry: $file" }
+              $stream = $entry.Open()
+              try { $packedHash = (Get-FileHash -InputStream $stream -Algorithm SHA256).Hash }
+              finally { $stream.Dispose() }
+              $sourceHash = (Get-FileHash -LiteralPath (Join-Path $bundle $file) -Algorithm SHA256).Hash
+              if ($packedHash -ne $sourceHash) { throw "ZIP content mismatch: $file" }
+            }
+          } finally { $archive.Dispose() }
+
+      - name: Record ZIP hashes and build provenance
+        id: record-zip
+        run: |
+          @'
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:GITHUB_WORKSPACE 'artifacts/windows'
+          $info = [ordered]@{
+            commit = $env:GITHUB_SHA; run_id = $env:GITHUB_RUN_ID; attempt = $env:GITHUB_RUN_ATTEMPT
+            rust = $env:RUST_VERSION; flutter = $env:FLUTTER_VERSION; llvm = $env:LLVM_VERSION
+            vcpkg = $env:VCPKG_COMMIT_ID
+            build_mode = $env:BUILD_MODE; portable_compression_level = $env:PORTABLE_COMPRESSION_LEVEL
+            signing = 'ephemeral self-signed Authenticode test certificate; not for production'
+            cargo_lock_sha256 = (Get-FileHash Cargo.lock -Algorithm SHA256).Hash
+            pubspec_lock_sha256 = (Get-FileHash flutter/pubspec.lock -Algorithm SHA256).Hash
+          }
+          $info | ConvertTo-Json | Set-Content -Encoding utf8 "$output/build-info.json"
+          Copy-Item Cargo.lock "$output/Cargo.lock"
+          Copy-Item flutter/pubspec.lock "$output/pubspec.lock"
+          Copy-Item "$env:RUNNER_TEMP/ashell-msys2-packages.txt" "$output/msys2-packages.txt"
+          flutter --version | Set-Content -Encoding utf8 "$output/flutter-version.txt"
+          if ($LASTEXITCODE -ne 0) { throw 'Flutter version query failed' }
+          rustc -Vv | Set-Content -Encoding utf8 "$output/rust-version.txt"
+          if ($LASTEXITCODE -ne 0) { throw 'Rust version query failed' }
+          $hashes = foreach ($file in (Get-ChildItem -LiteralPath $output -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name)) {
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($file.Name)"
+          }
+          $hashes | Set-Content -Encoding utf8 "$output/SHA256SUMS.txt"
+          '@ | Set-Content -Encoding utf8 "$env:RUNNER_TEMP/ashell-provenance.ps1"
+          & "$env:RUNNER_TEMP/ashell-provenance.ps1"
+
+      - name: Upload Release ZIP directly
+        id: upload-zip
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ashell-windows-x64.zip
+          path: artifacts/windows/ashell-windows-x64.zip
+          archive: false
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build the portable EXE
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundle = Join-Path $env:GITHUB_WORKSPACE 'flutter/build/windows/x64/runner/Release'
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'res/manifest.xml'
+          $originalManifest = [IO.File]::ReadAllBytes($manifestPath)
+          try {
+            $lines = [IO.File]::ReadAllLines($manifestPath) | Where-Object { $_ -notmatch 'dpiAware' }
+            [IO.File]::WriteAllLines($manifestPath, [string[]]$lines, [Text.UTF8Encoding]::new($false))
+            Push-Location libs/portable
+            try {
+              Write-Host "[$(Get-Date -Format o)] Compressing the portable bundle at level $env:PORTABLE_COMPRESSION_LEVEL"
+              python -u generate.py -f $bundle -o . -e "$bundle/ashell.exe" --level $env:PORTABLE_COMPRESSION_LEVEL
+              if ($LASTEXITCODE -ne 0) { throw 'Portable packer failed' }
+            } finally { Pop-Location }
+          } finally { [IO.File]::WriteAllBytes($manifestPath, $originalManifest) }
+          $packer = Get-Item -LiteralPath 'target/release/ashell-portable-packer.exe' -ErrorAction Stop
+          if ($packer.Length -eq 0) { throw 'Empty portable executable' }
+          Copy-Item -LiteralPath $packer.FullName -Destination 'artifacts/windows/ashell-windows-x64.exe'
+
+      - name: Test-sign and verify the portable EXE
+        id: sign-exe
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . "$env:RUNNER_TEMP/ashell-sign.ps1"
+          Add-TestSignature -Path 'artifacts/windows/ashell-windows-x64.exe' -Label 'ashell-windows-x64.exe'
+
+      - name: Record final hashes and build provenance
+        run: |
+          & "$env:RUNNER_TEMP/ashell-provenance.ps1"
+
+      - name: Upload EXE directly
+        id: upload-exe
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ashell-windows-x64.exe
+          path: artifacts/windows/ashell-windows-x64.exe
+          archive: false
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove the temporary signing identity
+        if: always() && steps.signing-identity.outputs.thumbprint != ''
+        shell: powershell
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $thumbprint = $env:ASHELL_TEST_CERT_THUMBPRINT
+          if ($thumbprint -notmatch '^[0-9A-Fa-f]{40}$') { throw 'Invalid test certificate thumbprint' }
+          $trustedPath = "Cert:\LocalMachine\Root\$thumbprint"
+          $privatePath = "Cert:\CurrentUser\My\$thumbprint"
+          try {
+            if (Test-Path -LiteralPath $trustedPath) { Remove-Item -LiteralPath $trustedPath -Force }
+          } finally {
+            if (Test-Path -LiteralPath $privatePath) { Remove-Item -LiteralPath $privatePath -DeleteKey -Force }
+          }
+
+      - name: Upload Windows build information
+        if: ${{ !cancelled() && steps.record-zip.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ashell-windows-build-info-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            artifacts/windows/
+            !artifacts/windows/*.exe
+            !artifacts/windows/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Download summary
+        if: always() && (steps.upload-exe.outcome == 'success' || steps.upload-zip.outcome == 'success')
+        env:
+          EXE_URL: ${{ steps.upload-exe.outputs.artifact-url }}
+          ZIP_URL: ${{ steps.upload-zip.outputs.artifact-url }}
+        run: |
+          '### Windows EXE' >> $env:GITHUB_STEP_SUMMARY
+          $links = @()
+          if ($env:EXE_URL) { $links += "[下载 EXE]($env:EXE_URL)" }
+          if ($env:ZIP_URL) { $links += "[下载 ZIP]($env:ZIP_URL)" }
+          ($links -join ' | ') >> $env:GITHUB_STEP_SUMMARY
+          '' >> $env:GITHUB_STEP_SUMMARY
+          '产物保留 14 天 校验与构建信息另存于 build-info 产物' >> $env:GITHUB_STEP_SUMMARY

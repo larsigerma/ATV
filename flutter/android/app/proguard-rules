@@ -1,0 +1,25 @@
+# Keep class members from protobuf generated code.
+-keepclassmembers class * extends com.google.protobuf.GeneratedMessageLite {
+  <fields>;
+}
+# Remove Kotlin null-checks at runtime (⚠️ unsafe, may cause plain NPE)
+-assumenosideeffects class kotlin.jvm.internal.Intrinsics {
+    public static void checkNotNullExpressionValue(java.lang.Object, java.lang.String);
+    public static void checkNotNullParameter(java.lang.Object, java.lang.String);
+    public static void checkNotNull(java.lang.Object);
+}
+
+# Read-only connection state for Android keep-screen-on policy.
+-keep class me.ashell.KeepScreenOnState { *; }
+
+# Standalone shell entry and its independent JNI state callback.
+-keep class me.ashell.localadb.AdbPrivacyOverlay { *; }
+-keep class me.ashell.localadb.AdbLayoutCapture { *; }
+-keep class me.ashell.localadb.AdbCaptureProfile { native <methods>; }
+-keep class me.ashell.localadb.LocalAdbPrivacy { native <methods>; }
+
+# Keep ZEGO public SDK classes stable when Android release minification is enabled.
+-keep class **.zego.** { *; }
+-keep class im.zego.** { *; }
+-keep class com.zego.** { *; }
+-keep class plugins.zego.** { *; }

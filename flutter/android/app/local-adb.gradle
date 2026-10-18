@@ -1,0 +1,39 @@
+// Isolated, phone-local ADB dependencies. No product/toolchain/native-core changes.
+// libadb-android 3.1.1: c849886ebc6d48e7b46d967e78a6bb65c90c3b74 (Apache-2.0 option).
+// SPAKE2: LGPL-3.0; Conscrypt: Apache-2.0; Bouncy Castle: MIT.
+repositories {
+    exclusiveContent {
+        forRepository {
+            maven { name = 'localAdbCentral'; url = uri('https://repo.maven.apache.org/maven2') }
+        }
+        filter {
+            includeGroup 'org.bouncycastle'
+            includeGroup 'org.conscrypt'
+        }
+    }
+    exclusiveContent {
+        forRepository {
+            maven { name = 'localAdbJitPack'; url = uri('https://jitpack.io') }
+        }
+        filter {
+            includeModule 'com.github.MuntashirAkon', 'libadb-android'
+            includeModule 'com.github.MuntashirAkon.spake2-java', 'spake2-android'
+        }
+    }
+}
+
+dependencies {
+    // Explicit dependency set avoids importing upstream's newer AndroidX/Kotlin graph.
+    implementation('com.github.MuntashirAkon:libadb-android:3.1.1') { transitive = false }
+    implementation('com.github.MuntashirAkon.spake2-java:spake2-android:2.2.1') { transitive = false }
+    implementation 'org.bouncycastle:bcprov-jdk15to18:1.81'
+    implementation 'org.conscrypt:conscrypt-android:2.5.3'
+}
+
+android {
+    buildTypes {
+        release {
+            proguardFile 'local-adb.pro'
+        }
+    }
+}

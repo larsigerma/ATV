@@ -1,0 +1,29 @@
+#!/bin/bash
+
+set -e
+
+if [ "$1" = configure ]; then
+
+	INITSYS=$(ls -al /proc/1/exe | awk -F' ' '{print $NF}' | awk -F'/' '{print $NF}')
+	ln -f -s /usr/share/ashell/ashell /usr/bin/ashell
+	
+	if [ "systemd" == "$INITSYS" ]; then
+
+		if [ -e /etc/systemd/system/ashell.service ]; then
+			rm /etc/systemd/system/ashell.service /usr/lib/systemd/system/ashell.service /usr/lib/systemd/user/ashell.service >/dev/null  2>&1
+		fi
+		version=$(python3 -V 2>&1 | grep -Po '(?<=Python )(.+)')
+		parsedVersion=$(echo "${version//./}")
+        mkdir -p /usr/lib/systemd/system/
+		cp /usr/share/ashell/files/systemd/ashell.service /usr/lib/systemd/system/ashell.service
+		# try fix error in Ubuntu 18.04
+		# Failed to reload ashell.service: Unit ashell.service is not loaded properly: Exec format error.
+		# /usr/lib/systemd/system/ashell.service:10: Executable path is not absolute: pkill -f "ashell --"
+		if [ -e /usr/bin/pkill ]; then
+			sed -i "s|pkill|/usr/bin/pkill|g" /usr/lib/systemd/system/ashell.service
+		fi
+		systemctl daemon-reload
+		systemctl enable ashell
+		systemctl start ashell
+	fi
+fi

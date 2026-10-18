@@ -1,0 +1,47 @@
+# arg 1:  the new package version
+#pre_install() {
+#}
+
+# arg 1:  the new package version
+post_install() {
+	# do something here
+	cp /usr/share/ashell/files/ashell.service /etc/systemd/system/ashell.service
+	cp /usr/share/ashell/files/ashell.desktop /usr/share/applications/
+	cp /usr/share/ashell/files/ashell-link.desktop /usr/share/applications/
+	systemctl daemon-reload
+	systemctl enable ashell
+	systemctl start ashell
+	update-desktop-database
+}
+
+# arg 1:  the new package version
+# arg 2:  the old package version
+pre_upgrade() {
+    systemctl stop ashell || true
+}
+
+# arg 1:  the new package version
+# arg 2:  the old package version
+post_upgrade() {
+	cp /usr/share/ashell/files/ashell.service /etc/systemd/system/ashell.service
+	cp /usr/share/ashell/files/ashell.desktop /usr/share/applications/
+	cp /usr/share/ashell/files/ashell-link.desktop /usr/share/applications/
+	systemctl daemon-reload
+	systemctl enable ashell
+	systemctl start ashell
+	update-desktop-database
+}
+
+# arg 1:  the old package version
+pre_remove() {
+	systemctl stop ashell || true
+	systemctl disable ashell || true
+	rm /etc/systemd/system/ashell.service || true
+}
+
+# arg 1:  the old package version
+post_remove() {
+	rm /usr/share/applications/ashell.desktop || true
+	rm /usr/share/applications/ashell-link.desktop || true
+	update-desktop-database
+}

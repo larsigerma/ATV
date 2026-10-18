@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">A Shell You</string>
+    <string name="launcher_name">一个壳子</string>
+    <string name="accessibility_service_description">官方授权</string>
+</resources>

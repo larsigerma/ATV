@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=A Shell YouURL Scheme Handler
+NoDisplay=true
+MimeType=x-scheme-handler/ashell;
+TryExec=ashell
+Exec=ashell %u
+Icon=ashell
+Terminal=false
+Type=Application
+StartupNotify=false
+StartupWMClass=ashell
